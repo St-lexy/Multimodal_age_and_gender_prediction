@@ -1,0 +1,12 @@
+streamlit
+torch
+torch.nn 
+torchaudio
+torchaudio
+torchvision
+numpy
+PIL
+io
+os
+cv2
+soundfile
