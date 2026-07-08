@@ -4,6 +4,6 @@ torchvision
 torchaudio
 pillow
 numpy<2.0.0
-opencv-python
+opencv-python-headless
 soundfile
 huggingface_hub
