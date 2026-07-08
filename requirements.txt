@@ -1,12 +1,9 @@
 streamlit
 torch
-torch.nn 
-torchaudio
-torchaudio
 torchvision
-numpy
-PIL
-io
-os
-cv2
+torchaudio
+pillow
+numpy<2.0.0
+opencv-python
 soundfile
+huggingface_hub
