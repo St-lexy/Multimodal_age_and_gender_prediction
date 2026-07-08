@@ -304,7 +304,8 @@ def load_voice_model():
     if os.path.exists(VOICE_MODEL_PATH):
         state = torch.load(VOICE_MODEL_PATH, map_location=DEVICE)
         
-        # FIX: Do the same thing for the voice model just in case it was saved the same way
+        # ── THE FIX ──
+        # Extract the actual nested model weights from the training checkpoint dictionary
         if isinstance(state, dict) and "model_state_dict" in state:
             state = state["model_state_dict"]
             
