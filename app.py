@@ -268,7 +268,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 HF_REPO_ID = "St0Lexy/Multimodal"
 FACE_MODEL_FILENAME = "best_face_model.pth"
-VOICE_MODEL_PATH = os.path.join(BASE_DIR, "best_voice_model.pth")
+VOICE_MODEL_FILENAME = "best_voice_model.pth"
 
 @st.cache_resource
 def load_face_model():
@@ -301,18 +301,28 @@ def load_face_model():
 @st.cache_resource
 def load_voice_model():
     model = VoiceAgeEstimator()
-    if os.path.exists(VOICE_MODEL_PATH):
-        state = torch.load(VOICE_MODEL_PATH, map_location=DEVICE)
+    try:
+        # 1. Download file from Hugging Face Hub (caches locally)
+        with st.spinner("Downloading voice model weights from Hugging Face..."):
+            resolved_path = hf_hub_download(
+                repo_id=HF_REPO_ID,
+                filename=VOICE_MODEL_FILENAME
+            )
         
-        # ── THE FIX ──
-        # Extract the actual nested model weights from the training checkpoint dictionary
+        # 2. Load weights safely to the active device
+        state = torch.load(resolved_path, map_location=DEVICE)
+        
+        # 3. Extract weights from training checkpoint dict wrapper if present
         if isinstance(state, dict) and "model_state_dict" in state:
             state = state["model_state_dict"]
             
         model.load_state_dict(state)
         model.to(DEVICE).eval()
         return model, True
-    return model.to(DEVICE).eval(), False
+        
+    except Exception as e:
+        st.error(f"Failed to load voice model from Hugging Face: {e}")
+        return model.to(DEVICE).eval(), False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INFERENCE
