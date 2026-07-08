@@ -9,6 +9,7 @@ from PIL import Image, ImageDraw
 import io
 import os
 import cv2
+from huggingface_hub import hf_hub_download
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -263,27 +264,39 @@ def preprocess_audio(audio_bytes: bytes) -> torch.Tensor:
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL LOADING  (cached so weights are only read once per session)
 # ─────────────────────────────────────────────────────────────────────────────
-
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-FACE_MODEL_PATH  = os.path.join(BASE_DIR, "best_face_model.pth")
+HF_REPO_ID = "St0Lexy/Multimodal"
+FACE_MODEL_FILENAME = "best_face_model.pth"
 VOICE_MODEL_PATH = os.path.join(BASE_DIR, "best_voice_model.pth")
 
 @st.cache_resource
 def load_face_model():
     model = ImprovedFaceModel(dropout_rate=0.5)
-    if os.path.exists(FACE_MODEL_PATH):
-        state = torch.load(FACE_MODEL_PATH, map_location=DEVICE)
+    
+    try:
+        # 1. Dynamically download/load the file path from Hugging Face Hub cache
+        with st.spinner("Downloading face model weights from Hugging Face..."):
+            resolved_face_model_path = hf_hub_download(
+                repo_id=HF_REPO_ID,
+                filename=FACE_MODEL_FILENAME
+            )
         
-        # FIX: Extract the actual model weights from the checkpoint dictionary
+        # 2. Read the downloaded weights file
+        state = torch.load(resolved_face_model_path, map_location=DEVICE)
+        
+        # Extract weights from checkpoint dict if necessary
         if isinstance(state, dict) and "model_state_dict" in state:
             state = state["model_state_dict"]
             
         model.load_state_dict(state)
         model.to(DEVICE).eval()
         return model, True
-    return model.to(DEVICE).eval(), False
-
+        
+    except Exception as e:
+        # Fallback gracefully if the download fails (e.g., no internet or wrong repo name)
+        st.error(f"Failed to load face model from Hugging Face: {e}")
+        return model.to(DEVICE).eval(), False
 
 @st.cache_resource
 def load_voice_model():
