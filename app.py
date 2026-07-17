@@ -4,6 +4,7 @@ import torch.nn as nn
 import torchaudio
 import torchaudio.transforms as T
 import torchvision.transforms as transforms
+from facenet_pytorch import MTCNN
 import numpy as np
 from PIL import Image, ImageDraw
 import io
@@ -212,9 +213,24 @@ def detect_and_crop_face(pil_img: Image.Image):
         
     return cropped_tensor, annotated_img
 
-def preprocess_image(pil_img: Image.Image) -> torch.Tensor:
-    """Convert a PIL image to a (1, 3, 128, 128) face tensor."""
-    return FACE_TRANSFORM(pil_img.convert("RGB")).unsqueeze(0)
+def preprocess_image(pil_img: Image.Image) -> tuple[torch.Tensor, bool]:
+    """
+    Returns (tensor, face_detected).
+    If MTCNN finds a face it returns an aligned, cropped, normalised tensor.
+    If no face is found it falls back to the plain resize — same as before —
+    and returns face_detected=False so the UI can warn the user.
+    """
+    detector = load_face_detector()
+    img_rgb  = pil_img.convert("RGB")
+
+    face_tensor = detector(img_rgb)   # returns (3, 128, 128) or None
+
+    if face_tensor is not None:
+        return face_tensor.unsqueeze(0).to(DEVICE), True
+    else:
+        # Fallback: plain resize + normalise (no face found)
+        fallback = FACE_TRANSFORM(img_rgb).unsqueeze(0).to(DEVICE)
+        return fallback, False
 
 
 import soundfile as sf
@@ -270,6 +286,18 @@ HF_REPO_ID = "St0Lexy/Multimodal"
 FACE_MODEL_FILENAME = "best_face_model.pth"
 VOICE_MODEL_FILENAME = "best_voice_model.pth"
 
+@st.cache_resource
+def load_face_detector():
+    # select_largest=True picks the biggest face if multiple are detected
+    return MTCNN(
+        image_size=128,
+        margin=20,          # a little padding around the face
+        keep_all=False,     # return only the most prominent face
+        select_largest=True,
+        post_process=True,  # normalises output to ImageNet stats automatically
+        device=DEVICE,
+    )
+    
 @st.cache_resource
 def load_face_model():
     model = ImprovedFaceModel(dropout_rate=0.5)
@@ -334,10 +362,18 @@ VOICE_WEIGHT  = 0.4
 
 
 def predict_face(model, tensor: torch.Tensor):
-    """
-    Returns (age_float, gender_label, gender_confidence_pct).
-    Fixed indexing bug to accurately track male and female arrays.
-    """
+    if face_file:
+        pil_img = Image.open(face_file)
+        face_tensor, face_found = preprocess_image(pil_img)
+    
+        if not face_found:
+            st.warning(
+                "⚠️ No face detected in the uploaded image. "
+                "Results may be unreliable — try a clearer frontal photo."
+            )
+    
+        face_age = predict_age_from_face(face_model, face_tensor)
+        gender_label, gender_conf = predict_gender(gender_model, pil_img)
     with torch.no_grad():
         tensor = tensor.to(DEVICE)
         age_raw, gender_logits = model(tensor)
