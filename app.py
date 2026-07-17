@@ -4,13 +4,14 @@ import torch.nn as nn
 import torchaudio
 import torchaudio.transforms as T
 import torchvision.transforms as transforms
-from facenet_pytorch import MTCNN
 import numpy as np
 from PIL import Image, ImageDraw
 import io
 import os
 import cv2
+import soundfile as sf
 from huggingface_hub import hf_hub_download
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -30,7 +31,6 @@ st.set_page_config(
 class ImprovedFaceModel(nn.Module):
     """
     Multi-task CNN for age regression + gender classification from face images.
-    Architecture matches the UTKFace training notebook (ImprovedFaceModel).
     Input: 3 × 128 × 128 RGB image (ImageNet-normalised)
     Outputs: (age_scalar, gender_logits[2])
     """
@@ -84,7 +84,6 @@ class ImprovedFaceModel(nn.Module):
 class VoiceAgeEstimator(nn.Module):
     """
     CNN for age regression from mel-spectrograms of speech.
-    Architecture matches the Common Voice training notebook (VoiceAgeEstimator).
     Input: 1 × 128 × 94 mel-spectrogram (min-max normalised to [0,1])
     Output: age_scalar (non-negative via ReLU)
     """
@@ -121,7 +120,7 @@ class VoiceAgeEstimator(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PREPROCESSING  (must match training notebooks exactly)
+# PREPROCESSING
 # ─────────────────────────────────────────────────────────────────────────────
 
 FACE_TRANSFORM = transforms.Compose([
@@ -133,7 +132,7 @@ FACE_TRANSFORM = transforms.Compose([
 
 SAMPLE_RATE  = 16_000
 DURATION_SEC = 3.0
-N_SAMPLES    = int(SAMPLE_RATE * DURATION_SEC)   # 48 000
+N_SAMPLES    = int(SAMPLE_RATE * DURATION_SEC)   # 48,000
 N_MELS       = 128
 N_FFT        = 2048
 HOP_LENGTH   = 512
@@ -148,25 +147,29 @@ MEL_TRANSFORM = T.MelSpectrogram(
 )
 AMPLITUDE_TO_DB = T.AmplitudeToDB()
 
-# Initialize YuNet once outside the function (making sure the .onnx file is in your folder)
+# Initialize YuNet once outside the function
 YUNET_MODEL_PATH = os.path.join(BASE_DIR, "face_detection_yunet_2023mar.onnx")
 
-def detect_and_crop_face(pil_img: Image.Image):
+def detect_and_crop_face(pil_img: Image.Image) -> tuple[torch.Tensor, Image.Image, bool]:
     """
-    Detects faces at any angle using OpenCV 5.0's native YuNet ONNX framework.
+    Detects faces using OpenCV's YuNet framework, crops with margin, and prepares tensor.
+    Returns: (cropped_tensor, annotated_image, face_detected_bool)
     """
-    # Convert PIL image to a standard numpy BGR array for OpenCV
     img_bgr = np.array(pil_img.convert("RGB"))
     img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_RGB2BGR)
     height, width, _ = img_bgr.shape
     
     annotated_img = pil_img.copy()
     draw = ImageDraw.Draw(annotated_img)
-    cropped_tensor = None
+    face_found = False
+
+    # Check if ONNX model path exists
+    if not os.path.exists(YUNET_MODEL_PATH):
+        # Graceful fallback: model missing
+        cropped_tensor = FACE_TRANSFORM(pil_img.convert("RGB")).unsqueeze(0)
+        return cropped_tensor, annotated_img, False
 
     try:
-        # OpenCV 5.0 positional syntax for FaceDetectorYN.create:
-        # (model, config, input_size, score_threshold, nms_threshold, top_k, backend_id, target_id)
         detector = cv2.FaceDetectorYN.create(
             YUNET_MODEL_PATH,  # model
             "",                # config
@@ -174,23 +177,18 @@ def detect_and_crop_face(pil_img: Image.Image):
             0.6,               # scoreThreshold
             0.3,               # nmsThreshold
             5000,              # topK
-            0,                 # backendId (0 = default/DNN_BACKEND_OPENCV)
-            0                  # targetId  (0 = default/DNN_TARGET_CPU)
+            0,                 # backendId
+            0                  # targetId
         )
-        
-        # Run inference
         _, faces = detector.detect(img_bgr)
-        
     except Exception as e:
-        st.error(f"YuNet Initialization Error: {e}")
         faces = None
 
-    # If faces are found, process the highest-scoring face
     if faces is not None and len(faces) > 0:
-        # The first 4 elements of YuNet output are x, y, width, height
+        face_found = True
         x, y, w, h = map(int, faces[0][0:4])
         
-        # Add 15% padding around the bounding box to match the UTKFace framing style
+        # 15% padding
         pad_x = int(w * 0.15)
         pad_y = int(h * 0.15)
         
@@ -199,86 +197,51 @@ def detect_and_crop_face(pil_img: Image.Image):
         crop_xmax = min(width, x + w + pad_x)
         crop_ymax = min(height, y + h + pad_y)
         
-        # 1. Crop face region
         face_crop = pil_img.crop((crop_xmin, crop_ymin, crop_xmax, crop_ymax))
-        
-        # 2. Transform cropped region into model format (1, 3, 128, 128)
         cropped_tensor = FACE_TRANSFORM(face_crop.convert("RGB")).unsqueeze(0)
-        
-        # 3. Draw a sleek bounding box overlay on original copy for UI presentation
         draw.rectangle([x, y, x + w, y + h], outline="#00FFCC", width=4)
     else:
-        # Fallback to processing the entire image if no face is found
         cropped_tensor = FACE_TRANSFORM(pil_img.convert("RGB")).unsqueeze(0)
         
-    return cropped_tensor, annotated_img
+    return cropped_tensor, annotated_img, face_found
 
-def preprocess_image(pil_img: Image.Image) -> tuple[torch.Tensor, bool]:
-    """
-    Returns (tensor, face_detected).
-    If MTCNN finds a face it returns an aligned, cropped, normalised tensor.
-    If no face is found it falls back to the plain resize — same as before —
-    and returns face_detected=False so the UI can warn the user.
-    """
-    detector = load_face_detector()
-    img_rgb  = pil_img.convert("RGB")
-
-    face_tensor = detector(img_rgb)   # returns (3, 128, 128) or None
-
-    if face_tensor is not None:
-        return face_tensor.unsqueeze(0).to(DEVICE), True
-    else:
-        # Fallback: plain resize + normalise (no face found)
-        fallback = FACE_TRANSFORM(img_rgb).unsqueeze(0).to(DEVICE)
-        return fallback, False
-
-
-import soundfile as sf
 
 def preprocess_audio(audio_bytes: bytes) -> torch.Tensor:
     """
-    Load audio from raw bytes using soundfile, resample to 16 kHz, 
-    convert to mono, compute mel-spectrogram, and return a (1, 1, 128, 94) tensor.
+    Load audio from raw bytes using soundfile, resample, 
+    compute mel-spectrogram, and return a (1, 1, 128, 94) tensor.
     """
-    # 1. Read audio bytes directly into a numpy array using soundfile
     buf = io.BytesIO(audio_bytes)
-    data, sr = sf.read(buf, dtype='float32') # data shape: (samples,) or (samples, channels)
+    data, sr = sf.read(buf, dtype='float32')
 
-    # 2. Convert to PyTorch tensor and ensure shape is (channels, samples)
     if len(data.shape) == 1:
-        # Mono array to (1, samples)
         waveform = torch.tensor(data).unsqueeze(0)
     else:
-        # Stereo array (samples, channels) to (channels, samples)
         waveform = torch.tensor(data).t()
 
-    # 3. Convert multi-channel (Stereo) to Mono if necessary
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
 
-    # 4. Resample to standard 16,000 Hz if the input is different
     if sr != SAMPLE_RATE:
         waveform = torchaudio.functional.resample(waveform, sr, SAMPLE_RATE)
 
-    # 5. Pad / trim to exactly 3 seconds (N_SAMPLES = 48000)
     if waveform.shape[1] < N_SAMPLES:
         pad = N_SAMPLES - waveform.shape[1]
         waveform = torch.nn.functional.pad(waveform, (0, pad))
     else:
         waveform = waveform[:, :N_SAMPLES]
 
-    # 6. Compute Mel-spectrogram → dB → min-max normalise
-    mel = MEL_TRANSFORM(waveform)          # (1, 128, T)
+    mel = MEL_TRANSFORM(waveform)  # (1, 128, T)
     mel = AMPLITUDE_TO_DB(mel)
     mel_min, mel_max = mel.min(), mel.max()
     if mel_max > mel_min:
         mel = (mel - mel_min) / (mel_max - mel_min)
 
-    return mel.unsqueeze(0)   # Outputs: (1, 1, 128, T)
+    return mel.unsqueeze(0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODEL LOADING  (cached so weights are only read once per session)
+# MODEL LOADING
 # ─────────────────────────────────────────────────────────────────────────────
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -287,42 +250,22 @@ FACE_MODEL_FILENAME = "best_face_model.pth"
 VOICE_MODEL_FILENAME = "best_voice_model.pth"
 
 @st.cache_resource
-def load_face_detector():
-    # select_largest=True picks the biggest face if multiple are detected
-    return MTCNN(
-        image_size=128,
-        margin=20,          # a little padding around the face
-        keep_all=False,     # return only the most prominent face
-        select_largest=True,
-        post_process=True,  # normalises output to ImageNet stats automatically
-        device=DEVICE,
-    )
-    
-@st.cache_resource
 def load_face_model():
     model = ImprovedFaceModel(dropout_rate=0.5)
-    
     try:
-        # 1. Dynamically download/load the file path from Hugging Face Hub cache
         with st.spinner("Downloading face model weights from Hugging Face..."):
             resolved_face_model_path = hf_hub_download(
                 repo_id=HF_REPO_ID,
                 filename=FACE_MODEL_FILENAME
             )
-        
-        # 2. Read the downloaded weights file
         state = torch.load(resolved_face_model_path, map_location=DEVICE)
-        
-        # Extract weights from checkpoint dict if necessary
         if isinstance(state, dict) and "model_state_dict" in state:
             state = state["model_state_dict"]
             
         model.load_state_dict(state)
         model.to(DEVICE).eval()
         return model, True
-        
     except Exception as e:
-        # Fallback gracefully if the download fails (e.g., no internet or wrong repo name)
         st.error(f"Failed to load face model from Hugging Face: {e}")
         return model.to(DEVICE).eval(), False
 
@@ -330,64 +273,46 @@ def load_face_model():
 def load_voice_model():
     model = VoiceAgeEstimator()
     try:
-        # 1. Download file from Hugging Face Hub (caches locally)
         with st.spinner("Downloading voice model weights from Hugging Face..."):
             resolved_path = hf_hub_download(
                 repo_id=HF_REPO_ID,
                 filename=VOICE_MODEL_FILENAME
             )
-        
-        # 2. Load weights safely to the active device
         state = torch.load(resolved_path, map_location=DEVICE)
-        
-        # 3. Extract weights from training checkpoint dict wrapper if present
         if isinstance(state, dict) and "model_state_dict" in state:
             state = state["model_state_dict"]
             
         model.load_state_dict(state)
         model.to(DEVICE).eval()
         return model, True
-        
     except Exception as e:
         st.error(f"Failed to load voice model from Hugging Face: {e}")
         return model.to(DEVICE).eval(), False
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# INFERENCE
+# INFERENCE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 GENDER_LABELS = {0: "Female", 1: "Male"}
-FACE_WEIGHT   = 0.6   # face model weighted more (lower MAE: 5.54 vs 6.97)
+FACE_WEIGHT   = 0.6
 VOICE_WEIGHT  = 0.4
 
 
 def predict_face(model, tensor: torch.Tensor):
-    if face_file:
-        pil_img = Image.open(face_file)
-        face_tensor, face_found = preprocess_image(pil_img)
-    
-        if not face_found:
-            st.warning(
-                "⚠️ No face detected in the uploaded image. "
-                "Results may be unreliable — try a clearer frontal photo."
-            )
-    
-        face_age = predict_age_from_face(face_model, face_tensor)
-        gender_label, gender_conf = predict_gender(gender_model, pil_img)
+    """
+    Accepts preprocessed image tensor and makes face age + gender prediction.
+    """
     with torch.no_grad():
         tensor = tensor.to(DEVICE)
         age_raw, gender_logits = model(tensor)
         
-        # Get scalar age safely
+        # Get scalar age
         age = float(age_raw.item())
         
-        # FIX: Squeeze out the batch dimension so it becomes a simple 1D tensor [prob_female, prob_male]
+        # Squeeze out batch dims
         probs = torch.softmax(gender_logits, dim=-1).squeeze(0)
-        
-        # Extract the highest probability index (0 for Female, 1 for Male)
         gender_idx = int(probs.argmax().item())
-        
-        # Extract the exact matching confidence rating cleanly from our 1D vector
         confidence = float(probs[gender_idx].item()) * 100
         
     return age, GENDER_LABELS[gender_idx], confidence
@@ -442,7 +367,6 @@ st.markdown(
     "When both are provided the system combines the two age estimates via weighted late fusion."
 )
 
-# Load models once
 face_model, face_loaded   = load_face_model()
 voice_model, voice_loaded = load_voice_model()
 
@@ -462,6 +386,10 @@ st.divider()
 # ── Input columns ──────────────────────────────────────────────────────────
 left, right = st.columns(2)
 
+# Placeholders for persisting tensors across runs
+processed_face_tensor = None
+face_detected = False
+
 with left:
     st.subheader("📷 Face Image")
     face_file = st.file_uploader(
@@ -469,15 +397,14 @@ with left:
         type=["jpg", "jpeg", "png"],
         key="face_upload",
     )
-    # Move the processing logic right here so the bounding box renders instantly upon upload!
     if face_file:
         img = Image.open(face_file)
         with st.spinner("Analyzing image features..."):
-            # Call our new function
-            face_tensor, annotated_image = detect_and_crop_face(img)
+            processed_face_tensor, annotated_image, face_detected = detect_and_crop_face(img)
         
-        # Display the image with the overlay box bounding the face
         st.image(annotated_image, caption="Processed Image (Bounding Box Overlay)", use_container_width=True)
+        if not face_detected:
+            st.warning("⚠️ No face detected. Defaulting to full-image crop. Predictions might be inaccurate.")
 
 with right:
     st.subheader("🎤 Voice Recording")
@@ -501,10 +428,9 @@ if st.button("🔍 Predict", type="primary", use_container_width=True):
     face_age = voice_age = gender_label = gender_conf = None
 
     # ── Face inference ──
-    if face_file:
+    if face_file and processed_face_tensor is not None:
         with st.spinner("Running face model…"):
-            face_tensor, _ = detect_and_crop_face(Image.open(face_file))
-            face_age, gender_label, gender_conf = predict_face(face_model, face_tensor)
+            face_age, gender_label, gender_conf = predict_face(face_model, processed_face_tensor)
 
     # ── Voice inference ──
     if voice_file:
