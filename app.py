@@ -12,7 +12,15 @@ import cv2
 import soundfile as sf
 from huggingface_hub import hf_hub_download
 
+# Safe import flags for Hugging Face components
+try:
+    from transformers import pipeline as hf_pipeline
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -147,13 +155,11 @@ MEL_TRANSFORM = T.MelSpectrogram(
 )
 AMPLITUDE_TO_DB = T.AmplitudeToDB()
 
-# Initialize YuNet once outside the function
 YUNET_MODEL_PATH = os.path.join(BASE_DIR, "face_detection_yunet_2023mar.onnx")
 
 def detect_and_crop_face(pil_img: Image.Image) -> tuple[torch.Tensor, Image.Image, bool]:
     """
     Detects faces using OpenCV's YuNet framework, crops with margin, and prepares tensor.
-    Returns: (cropped_tensor, annotated_image, face_detected_bool)
     """
     img_bgr = np.array(pil_img.convert("RGB"))
     img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_RGB2BGR)
@@ -163,32 +169,22 @@ def detect_and_crop_face(pil_img: Image.Image) -> tuple[torch.Tensor, Image.Imag
     draw = ImageDraw.Draw(annotated_img)
     face_found = False
 
-    # Check if ONNX model path exists
     if not os.path.exists(YUNET_MODEL_PATH):
-        # Graceful fallback: model missing
         cropped_tensor = FACE_TRANSFORM(pil_img.convert("RGB")).unsqueeze(0)
         return cropped_tensor, annotated_img, False
 
     try:
         detector = cv2.FaceDetectorYN.create(
-            YUNET_MODEL_PATH,  # model
-            "",                # config
-            (width, height),   # input_size
-            0.6,               # scoreThreshold
-            0.3,               # nmsThreshold
-            5000,              # topK
-            0,                 # backendId
-            0                  # targetId
+            YUNET_MODEL_PATH, "", (width, height), 0.6, 0.3, 5000, 0, 0
         )
         _, faces = detector.detect(img_bgr)
-    except Exception as e:
+    except Exception:
         faces = None
 
     if faces is not None and len(faces) > 0:
         face_found = True
         x, y, w, h = map(int, faces[0][0:4])
         
-        # 15% padding
         pad_x = int(w * 0.15)
         pad_y = int(h * 0.15)
         
@@ -207,10 +203,6 @@ def detect_and_crop_face(pil_img: Image.Image) -> tuple[torch.Tensor, Image.Imag
 
 
 def preprocess_audio(audio_bytes: bytes) -> torch.Tensor:
-    """
-    Load audio from raw bytes using soundfile, resample, 
-    compute mel-spectrogram, and return a (1, 1, 128, 94) tensor.
-    """
     buf = io.BytesIO(audio_bytes)
     data, sr = sf.read(buf, dtype='float32')
 
@@ -231,7 +223,7 @@ def preprocess_audio(audio_bytes: bytes) -> torch.Tensor:
     else:
         waveform = waveform[:, :N_SAMPLES]
 
-    mel = MEL_TRANSFORM(waveform)  # (1, 128, T)
+    mel = MEL_TRANSFORM(waveform)
     mel = AMPLITUDE_TO_DB(mel)
     mel_min, mel_max = mel.min(), mel.max()
     if mel_max > mel_min:
@@ -243,30 +235,29 @@ def preprocess_audio(audio_bytes: bytes) -> torch.Tensor:
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL LOADING
 # ─────────────────────────────────────────────────────────────────────────────
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 HF_REPO_ID = "St0Lexy/Multimodal"
 FACE_MODEL_FILENAME = "best_face_model.pth"
 VOICE_MODEL_FILENAME = "best_voice_model.pth"
+GENDER_MODEL_ID  = "dima806/man_woman_face_image_detection"
+
+FACE_WEIGHT  = 0.6
+VOICE_WEIGHT = 0.4
 
 @st.cache_resource
 def load_face_model():
     model = ImprovedFaceModel(dropout_rate=0.5)
     try:
         with st.spinner("Downloading face model weights from Hugging Face..."):
-            resolved_face_model_path = hf_hub_download(
-                repo_id=HF_REPO_ID,
-                filename=FACE_MODEL_FILENAME
-            )
+            resolved_face_model_path = hf_hub_download(repo_id=HF_REPO_ID, filename=FACE_MODEL_FILENAME)
         state = torch.load(resolved_face_model_path, map_location=DEVICE)
         if isinstance(state, dict) and "model_state_dict" in state:
             state = state["model_state_dict"]
-            
         model.load_state_dict(state)
         model.to(DEVICE).eval()
         return model, True
     except Exception as e:
-        st.error(f"Failed to load face model from Hugging Face: {e}")
+        st.error(f"Failed to load face model: {e}")
         return model.to(DEVICE).eval(), False
 
 @st.cache_resource
@@ -274,56 +265,68 @@ def load_voice_model():
     model = VoiceAgeEstimator()
     try:
         with st.spinner("Downloading voice model weights from Hugging Face..."):
-            resolved_path = hf_hub_download(
-                repo_id=HF_REPO_ID,
-                filename=VOICE_MODEL_FILENAME
-            )
+            resolved_path = hf_hub_download(repo_id=HF_REPO_ID, filename=VOICE_MODEL_FILENAME)
         state = torch.load(resolved_path, map_location=DEVICE)
         if isinstance(state, dict) and "model_state_dict" in state:
             state = state["model_state_dict"]
-            
         model.load_state_dict(state)
         model.to(DEVICE).eval()
         return model, True
     except Exception as e:
-        st.error(f"Failed to load voice model from Hugging Face: {e}")
+        st.error(f"Failed to load voice model: {e}")
         return model.to(DEVICE).eval(), False
+
+@st.cache_resource
+def load_gender_model():
+    """Dynamically initializes the pre-trained transformers ViT pipeline."""
+    if not TRANSFORMERS_AVAILABLE:
+        st.error("The 'transformers' library is not available. Gender prediction will fallback to Unknown.")
+        return None, False
+    try:
+        with st.spinner("Loading Vision Transformer gender classification pipeline..."):
+            # Set pipeline device map based on torch hardware availability
+            device_id = 0 if torch.cuda.is_available() else -1
+            pipe = hf_pipeline("image-classification", model=GENDER_MODEL_ID, device=device_id)
+        return pipe, True
+    except Exception as e:
+        st.error(f"Failed to initialize validation pipeline: {e}")
+        return None, False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INFERENCE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-GENDER_LABELS = {0: "Female", 1: "Male"}
-FACE_WEIGHT   = 0.6
-VOICE_WEIGHT  = 0.4
-
-
 def predict_face(model, tensor: torch.Tensor):
     """
-    Accepts preprocessed image tensor and makes face age + gender prediction.
+    Accepts preprocessed image tensor and extracts custom scalar face age.
     """
     with torch.no_grad():
         tensor = tensor.to(DEVICE)
-        age_raw, gender_logits = model(tensor)
-        
-        # Get scalar age
+        age_raw, _ = model(tensor) # Safely handle and discard the built-in head's logit outputs
         age = float(age_raw.item())
-        
-        # Squeeze out batch dims
-        probs = torch.softmax(gender_logits, dim=-1).squeeze(0)
-        gender_idx = int(probs.argmax().item())
-        confidence = float(probs[gender_idx].item()) * 100
-        
-    return age, GENDER_LABELS[gender_idx], confidence
+    return age
 
+def predict_gender(gender_classifier, pil_img: Image.Image):
+    """
+    Use the pre-trained ViT classifier for gender scoring.
+    """
+    if gender_classifier is None:
+        return "Unknown", 0.0
+    try:
+        results = gender_classifier(pil_img.convert("RGB"))
+        top = results[0]
+        label_raw = top["label"].lower()
+        confidence = top["score"] * 100
+        label = "Male" if "man" in label_raw else "Female"
+        return label, confidence
+    except Exception:
+        return "Unknown", 0.0
 
 def predict_voice(model, tensor: torch.Tensor):
-    """Returns age_float."""
     with torch.no_grad():
         out = model(tensor.to(DEVICE))
         return float(out.squeeze().item())
-
 
 def fuse_ages(face_age: float, voice_age: float) -> float:
     return FACE_WEIGHT * face_age + VOICE_WEIGHT * voice_age
@@ -369,12 +372,14 @@ st.markdown(
 
 face_model, face_loaded   = load_face_model()
 voice_model, voice_loaded = load_voice_model()
+gender_model, gender_loaded = load_gender_model()
 
 # Model status banner
 with st.expander("ℹ️ Model status", expanded=False):
-    col1, col2 = st.columns(2)
-    col1.metric("Face model",  "✅ Loaded" if face_loaded  else "⚠️ Weights not found (random weights)", "")
-    col2.metric("Voice model", "✅ Loaded" if voice_loaded else "⚠️ Weights not found (random weights)", "")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Face Age Model", "✅ Loaded" if face_loaded else "⚠️ Random Initialization")
+    col2.metric("Voice Age Model", "✅ Loaded" if voice_loaded else "⚠️ Random Initialization")
+    col3.metric("ViT Gender Model", "✅ Active" if gender_loaded else "⚠️ Inactive (Fallback)")
     st.caption(
         f"Running on: **{str(DEVICE).upper()}** | "
         f"Face weight (fusion): **{FACE_WEIGHT}** | "
@@ -386,7 +391,6 @@ st.divider()
 # ── Input columns ──────────────────────────────────────────────────────────
 left, right = st.columns(2)
 
-# Placeholders for persisting tensors across runs
 processed_face_tensor = None
 face_detected = False
 
@@ -427,10 +431,11 @@ if st.button("🔍 Predict", type="primary", use_container_width=True):
 
     face_age = voice_age = gender_label = gender_conf = None
 
-    # ── Face inference ──
+    # ── Face & Gender inference ──
     if face_file and processed_face_tensor is not None:
         with st.spinner("Running face model…"):
-            face_age, gender_label, gender_conf = predict_face(face_model, processed_face_tensor)
+            face_age = predict_face(face_model, processed_face_tensor)
+            gender_label, gender_conf = predict_gender(gender_model, img)
 
     # ── Voice inference ──
     if voice_file:
@@ -457,7 +462,7 @@ if st.button("🔍 Predict", type="primary", use_container_width=True):
         if face_age is not None:
             result_card("Face — Predicted Age", f"{face_age:.1f} yrs",
                         "From face image", "#4F8BF9")
-            result_card("Gender (face model)",
+            result_card("Gender (Transformers ViT)",
                         f"{gender_label}",
                         f"Confidence: {gender_conf:.1f}%",
                         "#6f42c1" if gender_label == "Female" else "#0d6efd")
@@ -519,7 +524,10 @@ built as a final-year undergraduate project.
 - Dataset: UTKFace (crop_part1 subset, 9,775 images)
 - Architecture: ImprovedFaceModel (9.27 M params, dual-head CNN)
 - Test MAE: **5.54 years** | R²: **0.881**
-- Gender accuracy: **80.16 %**
+
+**Gender Classifier**
+- Model: ViT (`dima806/man_woman_face_image_detection`)
+- Evaluated completely detached from the age estimation task
 
 **Voice model**
 - Dataset: Mozilla Common Voice (73,768 samples)
@@ -528,8 +536,7 @@ built as a final-year undergraduate project.
 
 **Late fusion**
 - Weighted average: 0.6 × face age + 0.4 × voice age
-- Gender taken entirely from the face model
 
 **Tech stack**
-- PyTorch · torchaudio · torchvision · Streamlit
+- PyTorch · Transformers · torchaudio · torchvision · Streamlit
     """)
