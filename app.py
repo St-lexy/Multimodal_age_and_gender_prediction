@@ -523,11 +523,8 @@ built as a final-year undergraduate project.
 **Face model**
 - Dataset: UTKFace (crop_part1 subset, 9,775 images)
 - Architecture: ImprovedFaceModel (9.27 M params, dual-head CNN)
-- Test MAE: **5.54 years** | R²: **0.881**
-
-**Gender Classifier**
-- Model: ViT (`dima806/man_woman_face_image_detection`)
-- Evaluated completely detached from the age estimation task
+- Test MAE: **4.99 years** | R²: **0.886**
+- Gender Accuracy: **87.49%**
 
 **Voice model**
 - Dataset: Mozilla Common Voice (73,768 samples)
